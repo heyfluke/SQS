@@ -20,15 +20,16 @@ import urllib
 import urlparse
 import xml.sax
 
-DEFAULT_HOST = 'sqs.us-east-1.amazonaws.com'
+DEFAULT_HOST = 'sqs.us-west-2.amazonaws.com'
 PORTS_BY_SECURITY = { True: 443, False: 80 }
+ISO8601_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 class AWSAuthConnection:
 
     VERSION = '2011-10-01'
     DEFAULT_EXPIRES_IN = 60
 
-    def __init__(self, aws_access_key_id, aws_secret_access_key, is_secure=True,
+    def __init__(self, aws_access_key_id, aws_secret_access_key, is_secure=False,
             server=DEFAULT_HOST, port=None):
 
         if not port:
@@ -41,6 +42,14 @@ class AWSAuthConnection:
         self.port = port
         self.accountids = {}
 
+    def connect(self, queue):
+        assert isinstance(queue, basestring)
+        if queue not in self.accountids:
+            response = self.get_queue_url(queue)
+            url = response.url
+            self.accountids[queue] = urlparse.urlparse(url).path.split('/')[1]
+        return self
+
     def get_queue_url(self, queue):
         query_args = {
                         'Action'    : 'GetQueueUrl',
@@ -50,9 +59,7 @@ class AWSAuthConnection:
 
     def send_message(self, queue, data, delay_seconds=0):
         assert isinstance(queue, basestring) and isinstance(data, str) and isinstance(delay_seconds, int)
-        if queue not in self.accountids:
-            url = self.get_queue_url(queue).url
-            self.accountids[queue] = urlparse.urlparse(url).path.split('/')[1]
+        assert queue in self.accountids, 'must call connect(queue) first!'
         accountid = self.accountids[queue]
         query_args = {
                         'Action'       : 'SendMessage',
@@ -60,22 +67,40 @@ class AWSAuthConnection:
                      }
         if delay_seconds:
             query_args['DelaySeconds'] = str(delay_seconds)
+        return Response(self._make_request('POST', accountid, queue, query_args))
+
+    def delete_message(self, queue, message):
+        assert isinstance(queue, basestring) and isinstance(message, (str, unicode, SQSMessage))
+        assert queue in self.accountids, 'must call connect(queue) first!'
+        accountid = self.accountids[queue]
+        query_args = {
+                        'Action'        : 'DeleteMessage',
+                        'ReceiptHandle' : getattr(message, 'receipt_handle', message)
+                     }
         return Response(self._make_request('GET', accountid, queue, query_args))
 
-    def receive_message(self, queue, num_messages=1, visibility_timeout=120, attribute_name='All;'):
-        assert isinstance(queue, basestring) and isinstance(num_messages, int) and \
-               isinstance(visibility_timeout, int) and isinstance(attribute_name, basestring)
-        if queue not in self.accountids:
-            url = self.get_queue_url(queue).url
-            self.accountids[queue] = urlparse.urlparse(url).path.split('/')[1]
+    def receive_message(self, queue, num_messages=1, visibility_timeout=None, attribute_name='All;'):
+        assert isinstance(queue, basestring) and isinstance(num_messages, int)
+        assert queue in self.accountids, 'must call connect(queue) first!'
         accountid = self.accountids[queue]
         query_args = {
                         'Action'       : 'ReceiveMessage',
                         'MaxNumberOfMessages'  : str(num_messages),
-                        'VisibilityTimeout' : str(visibility_timeout),
                         'AttributeName' : attribute_name,
                      }
+        if visibility_timeout:
+            query_args['VisibilityTimeout'] = str(visibility_timeout)
         return ReceiveMessageResponse(self._make_request('GET', accountid, queue, query_args))
+
+    def get_queue_attributes(self, queue, attribute_name='All;'):
+        assert isinstance(queue, basestring) and isinstance(num_messages, int)
+        assert queue in self.accountids, 'must call connect(queue) first!'
+        accountid = self.accountids[queue]
+        query_args = {
+                        'Action'       : 'GetQueueAttributes',
+                        'AttributeName' : attribute_name,
+                     }
+        return GetQueueAttributesResponse(self._make_request('GET', accountid, queue, query_args))
 
     # end public methods
 
@@ -94,8 +119,16 @@ class AWSAuthConnection:
         # build the path_argument string
         # add the ? in all cases since
         # signature and credentials follow path args
-        if len(query_args):
-            path += '?' + self._generate_query_with_signature(method, self.server, accountid, queue, query_args)
+        if method == 'GET':
+            if len(query_args):
+                path += '?' + self._generate_query_with_signature(method, self.server, accountid, queue, query_args)
+        elif method == 'POST':
+            if len(query_args):
+                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                data = self._generate_query_with_signature(method, self.server, accountid, queue, query_args)
+
+        if 'Date' not in headers:
+            headers['Date'] = time.strftime(ISO8601_FORMAT, time.gmtime())
 
         is_secure = self.is_secure
         host = "%s:%d" % (server, self.port)
@@ -119,8 +152,8 @@ class AWSAuthConnection:
             resp.read()
             scheme, host, path, params, query, fragment \
                     = urlparse.urlparse(location)
-            if scheme == "http":    is_secure = True
-            elif scheme == "https": is_secure = False
+            if scheme == "http":    is_secure = False
+            elif scheme == "https": is_secure = True
             else: raise invalidURL("Not http/https: " + location)
             if query: path += "?" + query
             # retry with redirect
@@ -133,7 +166,7 @@ class AWSAuthConnection:
         if expires:
             query_args['Expires'] = expires
         else:
-            query_args['Expires'] = str(int(time.time() + self.DEFAULT_EXPIRES_IN))
+            query_args['Expires'] = time.strftime(ISO8601_FORMAT, time.gmtime(time.time()+self.DEFAULT_EXPIRES_IN))
 
         params = query_args
         path = ''
@@ -187,6 +220,15 @@ class ReceiveMessageResponse(Response):
         else:
             self.messages = []
 
+class GetQueueAttributesResponse(Response):
+    def __init__(self, http_response):
+        Response.__init__(self, http_response)
+        if http_response.status < 300:
+            handler = GetQueueAttributesHandler()
+            xml.sax.parseString(self.body, handler)
+            self.attributes = handler.attributes
+        else:
+            self.attributes = []
 
 class GetQueueUrlHandler(xml.sax.ContentHandler):
     def __init__(self):
@@ -220,6 +262,8 @@ class ReceiveMessageHandler(xml.sax.ContentHandler):
             self.states[1] = 'id'
         if name == 'ReceiptHandle' and self.states[0] == 'msg':
             self.states[1] = 'handle'
+        if name == 'MD5OfBody' and self.states[0] == 'msg':
+            self.states[1] = 'md5'
         if name == 'Body' and self.states[0] == 'msg':
             self.states[1] = 'body'
         if name == 'Attribute' and self.states[0] == 'msg':
@@ -232,9 +276,11 @@ class ReceiveMessageHandler(xml.sax.ContentHandler):
     def endElement(self, name):
         if name == 'Message' and self.states[0] == 'msg':
             self.states = ['', '', '']
+            curr_msg = self.curr_msg
+            curr_msg.body = urllib.unquote_plus(curr_msg.body)
             curr_attribute = self.curr_attribute
-            self.curr_msg.attribute = dict([(curr_attribute[i], curr_attribute[i+1]) for i in xrange(0, len(curr_attribute), 2)])
-            self.messages.append(self.curr_msg)
+            curr_msg.attribute = dict([(curr_attribute[i], curr_attribute[i+1]) for i in xrange(0, len(curr_attribute), 2)])
+            self.messages.append(curr_msg)
             self.curr_msg = None
             self.curr_attribute = []
 
@@ -244,6 +290,8 @@ class ReceiveMessageHandler(xml.sax.ContentHandler):
                 self.curr_msg.id = content
             elif self.states[1] == 'handle':
                 self.curr_msg.receipt_handle = content
+            elif self.states[1] == 'md5':
+                self.curr_msg.md5 = content
             elif self.states[1] == 'body':
                 self.curr_msg.body = content
             elif self.states[1] == 'attribute':
@@ -251,3 +299,31 @@ class ReceiveMessageHandler(xml.sax.ContentHandler):
                     self.curr_attribute.append(content)
             else:
                 pass
+
+class GetQueueAttributesHandler(xml.sax.ContentHandler):
+    def __init__(self):
+        self.attributes = []
+        self.curr_attribute = []
+        self.state = ['', '']
+
+    def startElement(self, name, attrs):
+        if name == 'Attribute' and self.states[0] == '':
+            self.states = ['attribute', '']
+        if name == 'Name' and self.states[0] == 'attribute':
+            self.states[1] = 'name'
+        if name == 'Value' and self.states[0] == 'attribute':
+            self.states[1] = 'value'
+
+    def endElement(self, name):
+        if name == 'Attribute' and self.states[0] == 'attribute':
+            self.state = ['', '']
+            curr_attribute = dict([(self.curr_attribute[i], self.curr_attribute[i+1]) for i in xrange(0, len(self.curr_attribute), 2)])
+            self.attributes.append(curr_attribute)
+            self.curr_attribute = []
+
+    def characters(self, content):
+        if self.states[0] == 'attribute':
+            if self.states[1] in ('name', 'value'):
+                self.curr_attribute.append(content)
+        else:
+            pass
